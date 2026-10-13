@@ -1,0 +1,3 @@
+## 2025-05-18 - Avoid heap allocations & linear memory moves in AAudio callbacks and RTP jitter buffers
+**Learning:** In real-time Android audio processing (AAudio callback thread), using `std::vector::erase` at index 0 caused O(N) memory shifting on every callback chunk, while `JitterBuffer` allocating a `std::vector<uint8_t>` per incoming UDP packet (50+ packets/sec) caused heap allocation overhead and lock contention.
+**Action:** Use an O(1) read offset pointer (`pcmReadOffset_`) for consuming PCM buffer samples and inline fixed-size arrays (`uint8_t data[1024]`) for RTP payload buffers to guarantee zero-allocation hot paths.

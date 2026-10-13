@@ -26,7 +26,8 @@ public:
           playStream_(nullptr),
           opusDecoder_(nullptr),
           packetCount_(0),
-          underrunCount_(0) {}
+          underrunCount_(0),
+          pcmReadOffset_(0) {}
 
     ~ReceiverEngine() {
         stop();
@@ -45,6 +46,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(pcmMutex_);
             pcmBuffer_.clear();
+            pcmReadOffset_ = 0;
         }
 
         // 1. Initialize Opus Decoder
@@ -169,6 +171,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(pcmMutex_);
             pcmBuffer_.clear();
+            pcmReadOffset_ = 0;
         }
         LOGI("ReceiverEngine stopped.");
     }
@@ -190,7 +193,7 @@ private:
         int requiredSamples = numFrames * channels;
 
         // Decode more packets if we don't have enough samples in our buffer
-        while (engine->pcmBuffer_.size() < requiredSamples && engine->running_) {
+        while ((engine->pcmBuffer_.size() - engine->pcmReadOffset_) < static_cast<size_t>(requiredSamples) && engine->running_) {
             uint8_t packetData[1024];
             size_t packetLen = 0;
             bool isLost = false;
@@ -210,6 +213,17 @@ private:
                 }
 
                 if (decodedFrames > 0) {
+                    // Optimization: compact pcmBuffer_ before appending new decoded frames if read offset > 0
+                    if (engine->pcmReadOffset_ > 0) {
+                        size_t unreadSamples = engine->pcmBuffer_.size() - engine->pcmReadOffset_;
+                        if (unreadSamples > 0) {
+                            std::memmove(engine->pcmBuffer_.data(),
+                                         engine->pcmBuffer_.data() + engine->pcmReadOffset_,
+                                         unreadSamples * sizeof(float));
+                        }
+                        engine->pcmBuffer_.resize(unreadSamples);
+                        engine->pcmReadOffset_ = 0;
+                    }
                     engine->pcmBuffer_.insert(engine->pcmBuffer_.end(), decodedPcm, decodedPcm + decodedFrames * channels);
                 } else {
                     LOGE("Opus decode/PLC failed: %d", decodedFrames);
@@ -222,15 +236,21 @@ private:
         }
 
         // Copy samples from PCM buffer to output float buffer
-        if (engine->pcmBuffer_.size() >= requiredSamples) {
-            std::copy(engine->pcmBuffer_.begin(), engine->pcmBuffer_.begin() + requiredSamples, outFloat);
-            engine->pcmBuffer_.erase(engine->pcmBuffer_.begin(), engine->pcmBuffer_.begin() + requiredSamples);
+        size_t availableSamples = engine->pcmBuffer_.size() - engine->pcmReadOffset_;
+        if (availableSamples >= static_cast<size_t>(requiredSamples)) {
+            // Optimization: O(1) read using offset pointer instead of O(N) std::vector::erase from front
+            std::memcpy(outFloat, engine->pcmBuffer_.data() + engine->pcmReadOffset_, requiredSamples * sizeof(float));
+            engine->pcmReadOffset_ += requiredSamples;
+            if (engine->pcmReadOffset_ == engine->pcmBuffer_.size()) {
+                engine->pcmBuffer_.clear();
+                engine->pcmReadOffset_ = 0;
+            }
         } else {
             // Buffer starvation: copy whatever we have, fill the remainder with silence
-            int availableSamples = engine->pcmBuffer_.size();
             if (availableSamples > 0) {
-                std::copy(engine->pcmBuffer_.begin(), engine->pcmBuffer_.end(), outFloat);
+                std::memcpy(outFloat, engine->pcmBuffer_.data() + engine->pcmReadOffset_, availableSamples * sizeof(float));
                 engine->pcmBuffer_.clear();
+                engine->pcmReadOffset_ = 0;
             }
             std::memset(outFloat + availableSamples, 0, (requiredSamples - availableSamples) * sizeof(float));
             engine->underrunCount_++;
@@ -299,6 +319,7 @@ private:
     std::atomic<int> packetCount_;
     std::atomic<int> underrunCount_;
     std::vector<float> pcmBuffer_;
+    size_t pcmReadOffset_;
     std::mutex pcmMutex_;
 };
 

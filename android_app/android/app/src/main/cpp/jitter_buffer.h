@@ -7,13 +7,17 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 
 namespace audiostream {
 
+// Optimization: Use fixed inline array (1024 bytes) instead of std::vector<uint8_t>
+// to eliminate heap allocations on every incoming RTP UDP packet (50+ allocations/sec).
 struct AudioPacket {
     uint16_t seq;
     uint32_t timestamp;
-    std::vector<uint8_t> data;
+    uint16_t len;
+    uint8_t data[1024];
 };
 
 class JitterBuffer {
@@ -39,7 +43,17 @@ public:
             return;
         }
 
-        packets_[seq] = {seq, timestamp, std::vector<uint8_t>(data, data + len)};
+        AudioPacket packet;
+        packet.seq = seq;
+        packet.timestamp = timestamp;
+        packet.len = static_cast<uint16_t>(std::min(len, sizeof(packet.data)));
+        if (packet.len > 0 && data != nullptr) {
+            std::memcpy(packet.data, data, packet.len);
+        } else {
+            packet.len = 0;
+        }
+
+        packets_[seq] = packet;
         
         // Dynamic jitter estimation according to RFC 3550
         auto now = std::chrono::steady_clock::now();
@@ -123,9 +137,9 @@ public:
 
         auto it = packets_.find(nextSeq_);
         if (it != packets_.end()) {
-            outLen = it->second.data.size();
+            outLen = it->second.len;
             if (outLen <= maxLen) {
-                std::copy(it->second.data.begin(), it->second.data.end(), outBuf);
+                std::memcpy(outBuf, it->second.data, outLen);
             }
             packets_.erase(it);
             nextSeq_++;
